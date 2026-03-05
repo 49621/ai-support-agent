@@ -1,0 +1,17 @@
+﻿fastapi
+uvicorn[standard]
+websockets
+python-multipart
+google-generativeai
+langchain
+langchain-google-genai
+langchain-community
+deepgram-sdk
+chromadb
+sqlalchemy
+aiosqlite
+python-dotenv
+pydantic
+pydantic-settings
+httpx
+aiofiles
