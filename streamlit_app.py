@@ -8,7 +8,7 @@ import uuid
 from google import genai
 from google.genai import types
 
-API_KEY = "AIzaSyDL8j0ZzuBnNy4ZexA_6pwJ6Gmu1G7DT28"
+API_KEY = "AIzaSyDPJsIAngRVKs4bQTyyD_m2WG1UQ7ah10Y"
 client = genai.Client(api_key=API_KEY)
 
 # ── Shopping context ─────────────────────────────────────────────────────────
@@ -393,3 +393,4 @@ st.markdown(
     "<div style='text-align:center;color:rgba(255,255,255,0.6);font-size:0.8rem;'>Powered by Gemini AI · Multimodal Audio</div>",
     unsafe_allow_html=True,
 )
+
