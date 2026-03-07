@@ -1,41 +1,180 @@
 """
 AI Support Agent - Streamlit Frontend
-Beautiful chat interface with voice support
+Beautiful chat interface with voice support via Gemini multimodal
 """
 import streamlit as st
-import requests
 import base64
-from audio_recorder_streamlit import audio_recorder
 import uuid
+from google import genai
+from google.genai import types
 
-# Page config
+API_KEY = "AIzaSyDL8j0ZzuBnNy4ZexA_6pwJ6Gmu1G7DT28"
+client = genai.Client(api_key=API_KEY)
+
+# ── Shopping context ─────────────────────────────────────────────────────────
+
+SHOPPING_CONTEXT = """
+You are a helpful shopping assistant for an online store. You have access to the following customer data:
+
+CUSTOMER PROFILE:
+- Name: Alex Johnson
+- Email: alex.johnson@email.com
+- Member since: January 2023
+
+RECENT ORDERS:
+1. Order #ORD-7821 (Placed: March 1, 2026)
+   - Nike Air Max Sneakers (Size 10, Black) - $129.99
+   - Status: Out for Delivery (Expected: March 7, 2026)
+   - Tracking: DHL-4892017
+
+2. Order #ORD-7654 (Placed: February 20, 2026)
+   - Samsung 65" 4K Smart TV - $899.99
+   - Status: Delivered (February 25, 2026)
+   - Eligible for return until: March 27, 2026
+
+3. Order #ORD-7502 (Placed: February 10, 2026)
+   - Levi's Slim Fit Jeans (Size 32, Blue) - $69.99
+   - Apple AirPods Pro - $249.99
+   - Status: Delivered (February 14, 2026)
+   - Eligible for exchange until: March 14, 2026 (EXPIRED)
+
+4. Order #ORD-7301 (Placed: January 28, 2026)
+   - Coffee Maker Deluxe - $89.99
+   - Status: Cancelled (Refund processed on Feb 1, 2026)
+
+STORE POLICIES:
+- Returns accepted within 30 days of delivery
+- Exchanges accepted within 30 days of delivery
+- Cancellations only possible if order is not yet shipped
+- Refunds processed within 5-7 business days
+- Free shipping on orders above $50
+
+INSTRUCTIONS:
+- Be friendly, concise, and helpful
+- Always reference specific order numbers and details when relevant
+- If asked about cancellation, check if the order is already shipped
+- Guide users through exchange/return steps clearly
+- For issues you cannot resolve, ask them to contact support@store.com
+- Keep responses short and to the point (2-5 sentences max unless steps are needed)
+"""
+
+# ── Gemini helpers ────────────────────────────────────────────────────────────
+
+def get_gemini_reply(conversation_history):
+    """Text-only path: send conversation history and get a reply."""
+    try:
+        prompt = SHOPPING_CONTEXT + "\n\nCONVERSATION HISTORY:\n"
+        for msg in conversation_history:
+            role = "Customer" if msg["role"] == "user" else "Assistant"
+            prompt += f"{role}: {msg['content']}\n"
+        prompt += "Assistant:"
+
+        response = client.models.generate_content(
+            model="gemini-3-flash-preview",
+            contents=prompt,
+        )
+        return response.text.strip() if response.text else "Sorry, I couldn't generate a response."
+    except Exception as e:
+        return f"Sorry, I encountered an error: {str(e)}"
+
+
+def get_gemini_reply_from_audio(audio_bytes, conversation_history, language_label):
+    """
+    Audio path: send audio directly to Gemini multimodal with the correct mime type.
+    One single API call — Gemini listens to the audio and replies.
+    Returns (transcription_for_display, reply_text).
+    """
+    try:
+        # ── 1. Detect mime type from magic bytes ─────────────────────────
+        if audio_bytes[:4] == b"RIFF":
+            mime_type = "audio/wav"
+        elif audio_bytes[:4] == b"OggS":
+            mime_type = "audio/ogg"
+        elif audio_bytes[:2] in (b"\xff\xfb", b"\xff\xf3") or audio_bytes[:3] == b"ID3":
+            mime_type = "audio/mpeg"
+        else:
+            # st.audio_input records as webm/opus in Chrome & Firefox
+            mime_type = "audio/webm"
+
+        # ── 2. Base64-encode the raw audio bytes ──────────────────────────
+        audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+
+        # ── 3. Build conversation history string ──────────────────────────
+        history_str = ""
+        for msg in conversation_history:
+            role = "Customer" if msg["role"] == "user" else "Assistant"
+            history_str += f"{role}: {msg['content']}\n"
+
+        # ── 4. Single multimodal prompt ───────────────────────────────────
+        prompt_text = (
+            SHOPPING_CONTEXT
+            + f"\n\nThe customer is speaking in: {language_label}\n\n"
+            + "CONVERSATION HISTORY:\n"
+            + history_str
+            + "\nThe customer just sent a voice message (audio attached).\n"
+            + "Respond in exactly two lines:\n"
+            + "HEARD: <transcribe exactly what the customer said>\n"
+            + "REPLY: <your helpful assistant response following the instructions above>"
+        )
+
+        response = client.models.generate_content(
+            model="gemini-3-flash-preview",
+            contents=[
+                types.Content(
+                    role="user",
+                    parts=[
+                        types.Part(text=prompt_text),
+                        types.Part(
+                            inline_data=types.Blob(
+                                mime_type=mime_type,
+                                data=audio_b64,
+                            )
+                        ),
+                    ],
+                )
+            ],
+        )
+
+        raw = response.text.strip() if response.text else ""
+
+        # ── 5. Parse HEARD / REPLY from response ──────────────────────────
+        transcription = "[voice message]"
+        reply = raw  # fallback: treat entire response as the reply
+
+        for line in raw.splitlines():
+            stripped = line.strip()
+            if stripped.upper().startswith("HEARD:"):
+                transcription = stripped[6:].strip()
+            elif stripped.upper().startswith("REPLY:"):
+                reply = stripped[6:].strip()
+
+        if not reply:
+            reply = "I received your voice message but had trouble generating a response. Please try again."
+
+        return transcription, reply
+
+    except Exception as e:
+        return None, f"Sorry, I encountered an error processing your voice message: {str(e)}"
+
+
+# ── Page config ───────────────────────────────────────────────────────────────
+
 st.set_page_config(
     page_title="AI Support Agent",
     page_icon="🤖",
     layout="centered",
-    initial_sidebar_state="collapsed"
+    initial_sidebar_state="collapsed",
 )
 
-# Custom CSS
+# ── Custom CSS ────────────────────────────────────────────────────────────────
+
 st.markdown("""
 <style>
-    /* Hide Streamlit branding */
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
-    
-    /* Main container */
-    .main {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        padding: 0;
-    }
-    
-    /* Chat container */
-    .stApp {
-        max-width: 800px;
-        margin: 0 auto;
-    }
-    
-    /* Title */
+
+    .stApp { max-width: 800px; margin: 0 auto; }
+
     h1 {
         color: white !important;
         text-align: center;
@@ -43,10 +182,9 @@ st.markdown("""
         font-size: 2.5rem !important;
         font-weight: 800 !important;
     }
-    
-    /* Status badge */
+
     .status-badge {
-        background: rgba(255, 255, 255, 0.2);
+        background: rgba(255,255,255,0.2);
         color: white;
         padding: 0.5rem 1rem;
         border-radius: 20px;
@@ -56,8 +194,7 @@ st.markdown("""
         font-size: 0.9rem;
         font-weight: 600;
     }
-    
-    /* Chat messages */
+
     .chat-message {
         padding: 1rem;
         border-radius: 16px;
@@ -66,48 +203,35 @@ st.markdown("""
         gap: 1rem;
         animation: fadeIn 0.3s ease;
     }
-    
     @keyframes fadeIn {
         from { opacity: 0; transform: translateY(10px); }
-        to { opacity: 1; transform: translateY(0); }
+        to   { opacity: 1; transform: translateY(0); }
     }
-    
     .chat-message.user {
         background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
         color: white;
         margin-left: 2rem;
     }
-    
     .chat-message.assistant {
         background: white;
         color: #1f2937;
         margin-right: 2rem;
         box-shadow: 0 2px 8px rgba(0,0,0,0.1);
     }
-    
-    .chat-message .avatar {
-        font-size: 2rem;
-        flex-shrink: 0;
-    }
-    
-    .chat-message .content {
-        flex: 1;
-    }
-    
-    /* Input area */
+    .chat-message .avatar { font-size: 2rem; flex-shrink: 0; }
+    .chat-message .content { flex: 1; }
+
     .stTextInput > div > div > input {
         border-radius: 12px;
         border: 2px solid #e5e7eb;
         padding: 0.75rem 1rem;
         font-size: 1rem;
     }
-    
     .stTextInput > div > div > input:focus {
         border-color: #667eea;
-        box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+        box-shadow: 0 0 0 3px rgba(102,126,234,0.1);
     }
-    
-    /* Buttons */
+
     .stButton > button {
         background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
         color: white;
@@ -119,20 +243,12 @@ st.markdown("""
         width: 100%;
         transition: all 0.2s;
     }
-    
     .stButton > button:hover {
         transform: translateY(-2px);
-        box-shadow: 0 8px 16px rgba(102, 126, 234, 0.4);
+        box-shadow: 0 8px 16px rgba(102,126,234,0.4);
     }
-    
-    /* Language selector */
-    .stRadio > div {
-        display: flex;
-        gap: 0.5rem;
-        justify-content: center;
-        flex-wrap: wrap;
-    }
-    
+
+    .stRadio > div { display: flex; gap: 0.5rem; justify-content: center; flex-wrap: wrap; }
     .stRadio > div > label {
         background: white;
         padding: 0.5rem 1rem;
@@ -141,202 +257,139 @@ st.markdown("""
         cursor: pointer;
         transition: all 0.2s;
     }
-    
-    .stRadio > div > label:hover {
-        background: #f3f4f6;
-        transform: scale(1.05);
-    }
+    .stRadio > div > label:hover { background: #f3f4f6; transform: scale(1.05); }
 </style>
 """, unsafe_allow_html=True)
 
-# API Configuration
-API_URL = "http://localhost:8000/api"
+# ── Session state ─────────────────────────────────────────────────────────────
 
-# Initialize session state
-if 'session_id' not in st.session_state:
-    st.session_state.session_id = None
-if 'messages' not in st.session_state:
-    st.session_state.messages = []
-if 'language' not in st.session_state:
-    st.session_state.language = 'en'
+if "session_id" not in st.session_state:
+    st.session_state.session_id = str(uuid.uuid4())
+if "messages" not in st.session_state:
+    st.session_state.messages = [{
+        "role": "assistant",
+        "content": "👋 Hi Alex! I'm your AI shopping assistant. How can I help you today? You can ask about your orders, returns, or anything else!",
+    }]
+if "language" not in st.session_state:
+    st.session_state.language = "en"
+if "last_audio_id" not in st.session_state:
+    st.session_state.last_audio_id = None
 
-# Functions
-def start_session(language='en'):
-    """Start a new chat session"""
-    try:
-        response = requests.post(
-            f"{API_URL}/sessions/start",
-            json={
-                "tenant_id": "demo-shop",
-                "channel": "chat",
-                "language": language
-            }
-        )
-        data = response.json()
-        st.session_state.session_id = data['session_id']
-        st.session_state.messages = [{
-            'role': 'assistant',
-            'content': data['message']
-        }]
-        return True
-    except Exception as e:
-        st.error(f"Failed to start session: {e}")
-        return False
+language_names = {
+    "en": "🇬🇧 English",
+    "de": "🇩🇪 Deutsch",
+    "ar": "🇸🇦 العربية",
+    "fr": "🇫🇷 Français",
+    "es": "🇪🇸 Español",
+}
 
-def send_message(message):
-    """Send a message to the AI"""
-    if not st.session_state.session_id:
-        st.error("No active session. Please refresh the page.")
-        return
-    
-    try:
-        response = requests.post(
-            f"{API_URL}/chat/message",
-            json={
-                "session_id": st.session_state.session_id,
-                "message": message
-            }
-        )
-        data = response.json()
-        return data['reply']
-    except Exception as e:
-        return f"Error: {str(e)}"
+# ── Header ────────────────────────────────────────────────────────────────────
 
-def transcribe_audio(audio_bytes, language='en'):
-    """Transcribe audio to text"""
-    try:
-        files = {'file': ('audio.wav', audio_bytes, 'audio/wav')}
-        response = requests.post(
-            f"{API_URL}/voice/transcribe",
-            files=files,
-            params={'language': language}
-        )
-        data = response.json()
-        return data.get('transcription', '')
-    except Exception as e:
-        st.error(f"Transcription failed: {e}")
-        return None
-
-# UI
 st.markdown("<h1>🤖 AI Support Agent</h1>", unsafe_allow_html=True)
 
-# Language selector
 col1, col2, col3 = st.columns([1, 2, 1])
 with col2:
     language = st.radio(
         "Language",
-        ['en', 'de', 'ar', 'fr', 'es'],
-        index=0,
+        ["en", "de", "ar", "fr", "es"],
+        index=["en", "de", "ar", "fr", "es"].index(st.session_state.language),
         horizontal=True,
-        label_visibility="collapsed"
+        label_visibility="collapsed",
     )
     if language != st.session_state.language:
         st.session_state.language = language
-        if st.session_state.session_id:
-            st.info("Language changed. Starting new session...")
-            start_session(language)
-            st.rerun()
+        st.session_state.messages = [{
+            "role": "assistant",
+            "content": "👋 Hi Alex! Language updated. How can I help you today?",
+        }]
+        st.rerun()
 
-# Start session if not exists
-if not st.session_state.session_id:
-    start_session(st.session_state.language)
-
-# Status badge
-language_names = {
-    'en': '🇬🇧 English',
-    'de': '🇩🇪 Deutsch',
-    'ar': '🇸🇦 العربية',
-    'fr': '🇫🇷 Français',
-    'es': '🇪🇸 Español'
-}
 st.markdown(
     f"<div class='status-badge'>✅ Connected · {language_names.get(st.session_state.language, 'EN')}</div>",
-    unsafe_allow_html=True
+    unsafe_allow_html=True,
 )
 
-# Chat container
 st.markdown("---")
 
-# Display chat messages
+# ── Chat history ──────────────────────────────────────────────────────────────
+
 for message in st.session_state.messages:
-    role = message['role']
-    content = message['content']
-    
-    if role == 'user':
+    role = message["role"]
+    content = message["content"]
+    if role == "user":
         st.markdown(
-            f"""
-            <div class="chat-message user">
-                <div class="avatar">👤</div>
-                <div class="content">{content}</div>
-            </div>
-            """,
-            unsafe_allow_html=True
+            f'<div class="chat-message user"><div class="avatar">👤</div><div class="content">{content}</div></div>',
+            unsafe_allow_html=True,
         )
     else:
         st.markdown(
-            f"""
-            <div class="chat-message assistant">
-                <div class="avatar">🤖</div>
-                <div class="content">{content}</div>
-            </div>
-            """,
-            unsafe_allow_html=True
+            f'<div class="chat-message assistant"><div class="avatar">🤖</div><div class="content">{content}</div></div>',
+            unsafe_allow_html=True,
         )
 
-# Voice input
+st.markdown("---")
+
+# ── Voice Input ───────────────────────────────────────────────────────────────
+
 st.markdown("### 🎤 Voice Input")
-audio_bytes = audio_recorder(
-    text="Click to record",
-    recording_color="#667eea",
-    neutral_color="#e5e7eb",
-    icon_size="2x"
-)
+st.caption("Record your message — Gemini will listen and respond directly.")
 
-if audio_bytes:
-    with st.spinner("Transcribing..."):
-        transcription = transcribe_audio(audio_bytes, st.session_state.language)
-        if transcription:
-            st.session_state.messages.append({
-                'role': 'user',
-                'content': transcription
-            })
-            
-            with st.spinner("AI is thinking..."):
-                reply = send_message(transcription)
-                st.session_state.messages.append({
-                    'role': 'assistant',
-                    'content': reply
-                })
-            st.rerun()
+audio_input = st.audio_input("Record your message", key="audio_recorder", label_visibility="collapsed")
 
-# Text input
+if audio_input is not None:
+    # Read bytes first, then use for both playback and Gemini
+    audio_bytes = audio_input.read()
+    audio_id = hash(audio_bytes)
+
+    # Play back using bytes wrapped in BytesIO
+    import io
+    st.audio(io.BytesIO(audio_bytes), format="audio/webm")
+
+    if audio_id != st.session_state.last_audio_id:
+        st.session_state.last_audio_id = audio_id
+
+        with st.spinner("🎧 Gemini is listening and thinking..."):
+            lang_label = language_names.get(st.session_state.language, "English")
+            transcription, reply = get_gemini_reply_from_audio(
+                audio_bytes,
+                st.session_state.messages,
+                lang_label,
+            )
+
+        st.session_state.messages.append({
+            "role": "user",
+            "content": f"🎤 {transcription}" if transcription else "🎤 [voice message]",
+        })
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": reply,
+        })
+        st.rerun()
+
+# ── Text Input ────────────────────────────────────────────────────────────────
+
 st.markdown("### 💬 Text Input")
-user_input = st.text_input(
-    "Type your message...",
-    key="user_input",
-    label_visibility="collapsed"
-)
 
-col1, col2, col3 = st.columns([1, 1, 1])
-with col2:
-    if st.button("Send Message", use_container_width=True):
-        if user_input:
-            st.session_state.messages.append({
-                'role': 'user',
-                'content': user_input
-            })
-            
-            with st.spinner("AI is thinking..."):
-                reply = send_message(user_input)
-                st.session_state.messages.append({
-                    'role': 'assistant',
-                    'content': reply
-                })
-            st.rerun()
+with st.form(key="chat_form", clear_on_submit=True):
+    user_input = st.text_input(
+        "Type your message...",
+        key="user_input",
+        label_visibility="collapsed",
+        placeholder="e.g. What's the status of my order?",
+    )
+    submitted = st.form_submit_button("Send Message", use_container_width=True)
 
-# Footer
+if submitted and user_input:
+    st.session_state.messages.append({"role": "user", "content": user_input})
+    with st.spinner("AI is thinking..."):
+        reply = get_gemini_reply(st.session_state.messages)
+        st.session_state.messages.append({"role": "assistant", "content": reply})
+    st.rerun()
+
+# ── Footer ────────────────────────────────────────────────────────────────────
+
 st.markdown("---")
 st.markdown(
-    "<div style='text-align: center; color: rgba(255,255,255,0.6); font-size: 0.8rem;'>Powered by Gemini AI · Deepgram Voice</div>",
-    unsafe_allow_html=True
+    "<div style='text-align:center;color:rgba(255,255,255,0.6);font-size:0.8rem;'>Powered by Gemini AI · Multimodal Audio</div>",
+    unsafe_allow_html=True,
 )
